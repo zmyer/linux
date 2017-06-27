@@ -5,6 +5,7 @@
 #include <linux/hdreg.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/interrupt.h>
 #include <linux/virtio.h>
 #include <linux/virtio_blk.h>
 #include <linux/scatterlist.h>
@@ -12,6 +13,7 @@
 #include <scsi/scsi_cmnd.h>
 #include <linux/idr.h>
 #include <linux/blk-mq.h>
+#include <linux/blk-mq-virtio.h>
 #include <linux/numa.h>
 
 #define PART_BITS 4
@@ -109,7 +111,7 @@ static int virtblk_add_req_scsi(struct virtqueue *vq, struct virtblk_req *vbr,
 	return virtqueue_add_sgs(vq, sgs, num_out, num_in, vbr, GFP_ATOMIC);
 }
 
-static inline void virtblk_scsi_reques_done(struct request *req)
+static inline void virtblk_scsi_request_done(struct request *req)
 {
 	struct virtblk_req *vbr = blk_mq_rq_to_pdu(req);
 	struct virtio_blk *vblk = req->q->queuedata;
@@ -117,7 +119,7 @@ static inline void virtblk_scsi_reques_done(struct request *req)
 
 	sreq->resid_len = virtio32_to_cpu(vblk->vdev, vbr->in_hdr.residual);
 	sreq->sense_len = virtio32_to_cpu(vblk->vdev, vbr->in_hdr.sense_len);
-	req->errors = virtio32_to_cpu(vblk->vdev, vbr->in_hdr.errors);
+	sreq->result = virtio32_to_cpu(vblk->vdev, vbr->in_hdr.errors);
 }
 
 static int virtblk_ioctl(struct block_device *bdev, fmode_t mode,
@@ -142,7 +144,7 @@ static inline int virtblk_add_req_scsi(struct virtqueue *vq,
 {
 	return -EIO;
 }
-static inline void virtblk_scsi_reques_done(struct request *req)
+static inline void virtblk_scsi_request_done(struct request *req)
 {
 }
 #define virtblk_ioctl	NULL
@@ -173,19 +175,15 @@ static int virtblk_add_req(struct virtqueue *vq, struct virtblk_req *vbr,
 static inline void virtblk_request_done(struct request *req)
 {
 	struct virtblk_req *vbr = blk_mq_rq_to_pdu(req);
-	int error = virtblk_result(vbr);
 
 	switch (req_op(req)) {
 	case REQ_OP_SCSI_IN:
 	case REQ_OP_SCSI_OUT:
-		virtblk_scsi_reques_done(req);
-		break;
-	case REQ_OP_DRV_IN:
-		req->errors = (error != 0);
+		virtblk_scsi_request_done(req);
 		break;
 	}
 
-	blk_mq_end_request(req, error);
+	blk_mq_end_request(req, virtblk_result(vbr));
 }
 
 static void virtblk_done(struct virtqueue *vq)
@@ -203,7 +201,7 @@ static void virtblk_done(struct virtqueue *vq)
 		while ((vbr = virtqueue_get_buf(vblk->vqs[qid].vq, &len)) != NULL) {
 			struct request *req = blk_mq_rq_from_pdu(vbr);
 
-			blk_mq_complete_request(req, req->errors);
+			blk_mq_complete_request(req);
 			req_done = true;
 		}
 		if (unlikely(virtqueue_is_broken(vq)))
@@ -308,7 +306,8 @@ static int virtblk_get_id(struct gendisk *disk, char *id_str)
 	if (err)
 		goto out;
 
-	err = blk_execute_rq(vblk->disk->queue, vblk->disk, req, false);
+	blk_execute_rq(vblk->disk->queue, vblk->disk, req, false);
+	err = virtblk_result(blk_mq_rq_to_pdu(req));
 out:
 	blk_put_request(req);
 	return err;
@@ -426,6 +425,7 @@ static int init_vq(struct virtio_blk *vblk)
 	struct virtqueue **vqs;
 	unsigned short num_vqs;
 	struct virtio_device *vdev = vblk->vdev;
+	struct irq_affinity desc = { 0, };
 
 	err = virtio_cread_feature(vdev, VIRTIO_BLK_F_MQ,
 				   struct virtio_blk_config, num_queues,
@@ -452,7 +452,7 @@ static int init_vq(struct virtio_blk *vblk)
 	}
 
 	/* Discover virtqueues and write information to configuration.  */
-	err = vdev->config->find_vqs(vdev, num_vqs, vqs, callbacks, names);
+	err = virtio_find_vqs(vdev, num_vqs, vqs, callbacks, names, &desc);
 	if (err)
 		goto out;
 
@@ -572,11 +572,10 @@ static const struct device_attribute dev_attr_cache_type_rw =
 	__ATTR(cache_type, S_IRUGO|S_IWUSR,
 	       virtblk_cache_type_show, virtblk_cache_type_store);
 
-static int virtblk_init_request(void *data, struct request *rq,
-		unsigned int hctx_idx, unsigned int request_idx,
-		unsigned int numa_node)
+static int virtblk_init_request(struct blk_mq_tag_set *set, struct request *rq,
+		unsigned int hctx_idx, unsigned int numa_node)
 {
-	struct virtio_blk *vblk = data;
+	struct virtio_blk *vblk = set->driver_data;
 	struct virtblk_req *vbr = blk_mq_rq_to_pdu(rq);
 
 #ifdef CONFIG_VIRTIO_BLK_SCSI
@@ -586,10 +585,18 @@ static int virtblk_init_request(void *data, struct request *rq,
 	return 0;
 }
 
-static struct blk_mq_ops virtio_mq_ops = {
+static int virtblk_map_queues(struct blk_mq_tag_set *set)
+{
+	struct virtio_blk *vblk = set->driver_data;
+
+	return blk_mq_virtio_map_queues(set, vblk->vdev, 0);
+}
+
+static const struct blk_mq_ops virtio_mq_ops = {
 	.queue_rq	= virtio_queue_rq,
 	.complete	= virtblk_request_done,
 	.init_request	= virtblk_init_request,
+	.map_queues	= virtblk_map_queues,
 };
 
 static unsigned int virtblk_queue_depth;

@@ -17,8 +17,12 @@
 #include <linux/interrupt.h>
 #include <linux/kernel_stat.h>
 #include <linux/percpu.h>
+#include <linux/nmi.h>
 #include <linux/profile.h>
-#include <linux/sched.h>
+#include <linux/sched/signal.h>
+#include <linux/sched/clock.h>
+#include <linux/sched/stat.h>
+#include <linux/sched/nohz.h>
 #include <linux/module.h>
 #include <linux/irq_work.h>
 #include <linux/posix-timers.h>
@@ -987,6 +991,18 @@ ktime_t tick_nohz_get_sleep_length(void)
 	struct tick_sched *ts = this_cpu_ptr(&tick_cpu_sched);
 
 	return ts->sleep_length;
+}
+
+/**
+ * tick_nohz_get_idle_calls - return the current idle calls counter value
+ *
+ * Called from the schedutil frequency scaling governor in scheduler context.
+ */
+unsigned long tick_nohz_get_idle_calls(void)
+{
+	struct tick_sched *ts = this_cpu_ptr(&tick_cpu_sched);
+
+	return ts->idle_calls;
 }
 
 static void tick_nohz_account_idle_ticks(struct tick_sched *ts)

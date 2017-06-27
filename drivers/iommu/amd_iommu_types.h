@@ -569,6 +569,11 @@ struct amd_iommu {
 	volatile u64 __aligned(8) cmd_sem;
 };
 
+static inline struct amd_iommu *dev_to_amd_iommu(struct device *dev)
+{
+	return container_of(dev, struct amd_iommu, iommu.dev);
+}
+
 #define ACPIHID_UID_LEN 256
 #define ACPIHID_HID_LEN 9
 
@@ -605,9 +610,6 @@ extern struct list_head amd_iommu_list;
  * The indices are referenced in the protection domains
  */
 extern struct amd_iommu *amd_iommus[MAX_IOMMUS];
-
-/* Number of IOMMUs present in the system */
-extern int amd_iommus_present;
 
 /*
  * Declarations for the global list of all protection domains

@@ -52,6 +52,7 @@
 #define __KERNEL_SYSCALLS__
 #include <linux/unistd.h>
 #include <linux/vmalloc.h>
+#include <linux/sched/signal.h>
 
 #include <linux/drbd_limits.h>
 #include "drbd_int.h"
@@ -930,7 +931,6 @@ void assign_p_sizes_qlim(struct drbd_device *device, struct p_sizes *p, struct r
 		p->qlim->io_min = cpu_to_be32(queue_io_min(q));
 		p->qlim->io_opt = cpu_to_be32(queue_io_opt(q));
 		p->qlim->discard_enabled = blk_queue_discard(q);
-		p->qlim->discard_zeroes_data = queue_discard_zeroes_data(q);
 		p->qlim->write_same_capable = !!q->limits.max_write_same_sectors;
 	} else {
 		q = device->rq_queue;
@@ -940,7 +940,6 @@ void assign_p_sizes_qlim(struct drbd_device *device, struct p_sizes *p, struct r
 		p->qlim->io_min = cpu_to_be32(queue_io_min(q));
 		p->qlim->io_opt = cpu_to_be32(queue_io_opt(q));
 		p->qlim->discard_enabled = 0;
-		p->qlim->discard_zeroes_data = 0;
 		p->qlim->write_same_capable = 0;
 	}
 }
@@ -1667,7 +1666,8 @@ static u32 bio_flags_to_wire(struct drbd_connection *connection,
 			(bio->bi_opf & REQ_FUA ? DP_FUA : 0) |
 			(bio->bi_opf & REQ_PREFLUSH ? DP_FLUSH : 0) |
 			(bio_op(bio) == REQ_OP_WRITE_SAME ? DP_WSAME : 0) |
-			(bio_op(bio) == REQ_OP_DISCARD ? DP_DISCARD : 0);
+			(bio_op(bio) == REQ_OP_DISCARD ? DP_DISCARD : 0) |
+			(bio_op(bio) == REQ_OP_WRITE_ZEROES ? DP_DISCARD : 0);
 	else
 		return bio->bi_opf & REQ_SYNC ? DP_RW_SYNC : 0;
 }
@@ -1846,7 +1846,7 @@ int drbd_send_out_of_sync(struct drbd_peer_device *peer_device, struct drbd_requ
 int drbd_send(struct drbd_connection *connection, struct socket *sock,
 	      void *buf, size_t size, unsigned msg_flags)
 {
-	struct kvec iov;
+	struct kvec iov = {.iov_base = buf, .iov_len = size};
 	struct msghdr msg;
 	int rv, sent = 0;
 
@@ -1855,14 +1855,13 @@ int drbd_send(struct drbd_connection *connection, struct socket *sock,
 
 	/* THINK  if (signal_pending) return ... ? */
 
-	iov.iov_base = buf;
-	iov.iov_len  = size;
-
 	msg.msg_name       = NULL;
 	msg.msg_namelen    = 0;
 	msg.msg_control    = NULL;
 	msg.msg_controllen = 0;
 	msg.msg_flags      = msg_flags | MSG_NOSIGNAL;
+
+	iov_iter_kvec(&msg.msg_iter, WRITE | ITER_KVEC, &iov, 1, size);
 
 	if (sock == connection->data.socket) {
 		rcu_read_lock();
@@ -1871,7 +1870,7 @@ int drbd_send(struct drbd_connection *connection, struct socket *sock,
 		drbd_update_congested(connection);
 	}
 	do {
-		rv = kernel_sendmsg(sock, &msg, &iov, 1, iov.iov_len);
+		rv = sock_sendmsg(sock, &msg);
 		if (rv == -EAGAIN) {
 			if (we_should_drop_the_connection(connection, sock))
 				break;
@@ -1885,8 +1884,6 @@ int drbd_send(struct drbd_connection *connection, struct socket *sock,
 		if (rv < 0)
 			break;
 		sent += rv;
-		iov.iov_base += rv;
-		iov.iov_len  -= rv;
 	} while (sent < size);
 
 	if (sock == connection->data.socket)
@@ -2915,11 +2912,9 @@ out_idr_remove_vol:
 	idr_remove(&connection->peer_devices, vnr);
 out_idr_remove_from_resource:
 	for_each_connection(connection, resource) {
-		peer_device = idr_find(&connection->peer_devices, vnr);
-		if (peer_device) {
-			idr_remove(&connection->peer_devices, vnr);
+		peer_device = idr_remove(&connection->peer_devices, vnr);
+		if (peer_device)
 			kref_put(&connection->kref, drbd_destroy_connection);
-		}
 	}
 	for_each_peer_device_safe(peer_device, tmp_peer_device, device) {
 		list_del(&peer_device->peer_devices);

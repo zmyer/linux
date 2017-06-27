@@ -508,7 +508,7 @@ bool tipc_msg_reverse(u32 own_node,  struct sk_buff **skb, int err)
 	}
 
 	if (skb_cloned(_skb) &&
-	    pskb_expand_head(_skb, BUF_HEADROOM, BUF_TAILROOM, GFP_KERNEL))
+	    pskb_expand_head(_skb, BUF_HEADROOM, BUF_TAILROOM, GFP_ATOMIC))
 		goto exit;
 
 	/* Now reverse the concerned fields */
@@ -605,6 +605,23 @@ error:
 	pr_warn("Failed do clone local mcast rcv buffer\n");
 	kfree_skb(head);
 	return false;
+}
+
+bool tipc_msg_pskb_copy(u32 dst, struct sk_buff_head *msg,
+			struct sk_buff_head *cpy)
+{
+	struct sk_buff *skb, *_skb;
+
+	skb_queue_walk(msg, skb) {
+		_skb = pskb_copy(skb, GFP_ATOMIC);
+		if (!_skb) {
+			__skb_queue_purge(cpy);
+			return false;
+		}
+		msg_set_destnode(buf_msg(_skb), dst);
+		__skb_queue_tail(cpy, _skb);
+	}
+	return true;
 }
 
 /* tipc_skb_queue_sorted(); sort pkt into list according to sequence number

@@ -28,6 +28,7 @@
 #include <linux/timer.h>
 #include <linux/version.h>
 #include <linux/wait.h>
+#include <linux/sched/signal.h>
 #include <linux/blockgroup_lock.h>
 #include <linux/percpu_counter.h>
 #include <linux/ratelimit.h>
@@ -2355,17 +2356,16 @@ extern int ext4_find_dest_de(struct inode *dir, struct inode *inode,
 			     void *buf, int buf_size,
 			     struct ext4_filename *fname,
 			     struct ext4_dir_entry_2 **dest_de);
-int ext4_insert_dentry(struct inode *dir,
-		       struct inode *inode,
-		       struct ext4_dir_entry_2 *de,
-		       int buf_size,
-		       struct ext4_filename *fname);
+void ext4_insert_dentry(struct inode *inode,
+			struct ext4_dir_entry_2 *de,
+			int buf_size,
+			struct ext4_filename *fname);
 static inline void ext4_update_dx_flag(struct inode *inode)
 {
 	if (!ext4_has_feature_dir_index(inode->i_sb))
 		ext4_clear_inode_flag(inode, EXT4_INODE_INDEX);
 }
-static unsigned char ext4_filetype_table[] = {
+static const unsigned char ext4_filetype_table[] = {
 	DT_UNKNOWN, DT_REG, DT_DIR, DT_CHR, DT_BLK, DT_FIFO, DT_SOCK, DT_LNK
 };
 
@@ -2462,10 +2462,10 @@ extern struct inode *ext4_iget(struct super_block *, unsigned long);
 extern struct inode *ext4_iget_normal(struct super_block *, unsigned long);
 extern int  ext4_write_inode(struct inode *, struct writeback_control *);
 extern int  ext4_setattr(struct dentry *, struct iattr *);
-extern int  ext4_getattr(struct vfsmount *mnt, struct dentry *dentry,
-				struct kstat *stat);
+extern int  ext4_getattr(const struct path *, struct kstat *, u32, unsigned int);
 extern void ext4_evict_inode(struct inode *);
 extern void ext4_clear_inode(struct inode *);
+extern int  ext4_file_getattr(const struct path *, struct kstat *, u32, unsigned int);
 extern int  ext4_sync_inode(handle_t *, struct inode *);
 extern void ext4_dirty_inode(struct inode *, int);
 extern int ext4_change_inode_journal_flag(struct inode *, int);
@@ -2476,15 +2476,14 @@ extern int ext4_truncate(struct inode *);
 extern int ext4_punch_hole(struct inode *inode, loff_t offset, loff_t length);
 extern int ext4_truncate_restart_trans(handle_t *, struct inode *, int nblocks);
 extern void ext4_set_inode_flags(struct inode *);
-extern void ext4_get_inode_flags(struct ext4_inode_info *);
 extern int ext4_alloc_da_blocks(struct inode *inode);
 extern void ext4_set_aops(struct inode *inode);
 extern int ext4_writepage_trans_blocks(struct inode *);
 extern int ext4_chunk_trans_blocks(struct inode *, int nrblocks);
 extern int ext4_zero_partial_blocks(handle_t *handle, struct inode *inode,
 			     loff_t lstart, loff_t lend);
-extern int ext4_page_mkwrite(struct vm_area_struct *vma, struct vm_fault *vmf);
-extern int ext4_filemap_fault(struct vm_area_struct *vma, struct vm_fault *vmf);
+extern int ext4_page_mkwrite(struct vm_fault *vmf);
+extern int ext4_filemap_fault(struct vm_fault *vmf);
 extern qsize_t *ext4_get_reserved_space(struct inode *inode);
 extern int ext4_get_projid(struct inode *inode, kprojid_t *projid);
 extern void ext4_da_update_reserve_space(struct inode *inode,
@@ -2524,7 +2523,6 @@ extern int ext4_search_dir(struct buffer_head *bh,
 			   int buf_size,
 			   struct inode *dir,
 			   struct ext4_filename *fname,
-			   const struct qstr *d_name,
 			   unsigned int offset,
 			   struct ext4_dir_entry_2 **res_dir);
 extern int ext4_generic_delete_entry(handle_t *handle,
@@ -3008,7 +3006,6 @@ extern int htree_inlinedir_to_tree(struct file *dir_file,
 				   int *has_inline_data);
 extern struct buffer_head *ext4_find_inline_entry(struct inode *dir,
 					struct ext4_filename *fname,
-					const struct qstr *d_name,
 					struct ext4_dir_entry_2 **res_dir,
 					int *has_inline_data);
 extern int ext4_delete_inline_entry(handle_t *handle,
@@ -3050,7 +3047,7 @@ extern int ext4_handle_dirty_dirent_node(handle_t *handle,
 					 struct inode *inode,
 					 struct buffer_head *bh);
 #define S_SHIFT 12
-static unsigned char ext4_type_by_mode[S_IFMT >> S_SHIFT] = {
+static const unsigned char ext4_type_by_mode[S_IFMT >> S_SHIFT] = {
 	[S_IFREG >> S_SHIFT]	= EXT4_FT_REG_FILE,
 	[S_IFDIR >> S_SHIFT]	= EXT4_FT_DIR,
 	[S_IFCHR >> S_SHIFT]	= EXT4_FT_CHRDEV,
@@ -3244,7 +3241,7 @@ static inline void ext4_clear_io_unwritten_flag(ext4_io_end_t *io_end)
 	}
 }
 
-extern struct iomap_ops ext4_iomap_ops;
+extern const struct iomap_ops ext4_iomap_ops;
 
 #endif	/* __KERNEL__ */
 

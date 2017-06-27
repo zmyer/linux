@@ -33,6 +33,7 @@
 #include <linux/vfs.h>
 #include <linux/task_io_accounting_ops.h>
 #include <linux/uaccess.h>
+#include <linux/uuid.h>
 #include <linux/pagemap.h>
 #include <linux/xattr.h>
 #include "smb2pdu.h"
@@ -562,8 +563,10 @@ SMB2_negotiate(const unsigned int xid, struct cifs_ses *ses)
 	 * but for time being this is our only auth choice so doesn't matter.
 	 * We just found a server which sets blob length to zero expecting raw.
 	 */
-	if (blob_length == 0)
+	if (blob_length == 0) {
 		cifs_dbg(FYI, "missing security blob on negprot\n");
+		server->sec_ntlmssp = true;
+	}
 
 	rc = cifs_enable_signing(server, ses->sign);
 	if (rc)
@@ -620,6 +623,7 @@ int smb3_validate_negotiate(const unsigned int xid, struct cifs_tcon *tcon)
 
 	rc = SMB2_ioctl(xid, tcon, NO_FILE_ID, NO_FILE_ID,
 		FSCTL_VALIDATE_NEGOTIATE_INFO, true /* is_fsctl */,
+		false /* use_ipc */,
 		(char *)&vneg_inbuf, sizeof(struct validate_negotiate_info_req),
 		(char **)&pneg_rsp, &rsplen);
 
@@ -629,8 +633,12 @@ int smb3_validate_negotiate(const unsigned int xid, struct cifs_tcon *tcon)
 	}
 
 	if (rsplen != sizeof(struct validate_negotiate_info_rsp)) {
-		cifs_dbg(VFS, "invalid size of protocol negotiate response\n");
-		return -EIO;
+		cifs_dbg(VFS, "invalid protocol negotiate response size: %d\n",
+			 rsplen);
+
+		/* relax check since Mac returns max bufsize allowed on ioctl */
+		if (rsplen > CIFSMaxBufSize)
+			return -EIO;
 	}
 
 	/* check validate negotiate info response matches what we got earlier */
@@ -654,6 +662,28 @@ int smb3_validate_negotiate(const unsigned int xid, struct cifs_tcon *tcon)
 vneg_out:
 	cifs_dbg(VFS, "protocol revalidation - security settings mismatch\n");
 	return -EIO;
+}
+
+enum securityEnum
+smb2_select_sectype(struct TCP_Server_Info *server, enum securityEnum requested)
+{
+	switch (requested) {
+	case Kerberos:
+	case RawNTLMSSP:
+		return requested;
+	case NTLMv2:
+		return RawNTLMSSP;
+	case Unspecified:
+		if (server->sec_ntlmssp &&
+			(global_secflags & CIFSSEC_MAY_NTLMSSP))
+			return RawNTLMSSP;
+		if ((server->sec_kerberos || server->sec_mskerberos) &&
+			(global_secflags & CIFSSEC_MAY_KRB5))
+			return Kerberos;
+		/* Fallthrough */
+	default:
+		return Unspecified;
+	}
 }
 
 struct SMB2_sess_data {
@@ -1008,10 +1038,17 @@ out:
 static int
 SMB2_select_sec(struct cifs_ses *ses, struct SMB2_sess_data *sess_data)
 {
-	if (ses->sectype != Kerberos && ses->sectype != RawNTLMSSP)
-		ses->sectype = RawNTLMSSP;
+	int type;
 
-	switch (ses->sectype) {
+	type = smb2_select_sectype(ses->server, ses->sectype);
+	cifs_dbg(FYI, "sess setup type %d\n", type);
+	if (type == Unspecified) {
+		cifs_dbg(VFS,
+			"Unable to select appropriate authentication method!");
+		return -EINVAL;
+	}
+
+	switch (type) {
 	case Kerberos:
 		sess_data->func = SMB2_auth_kerberos;
 		break;
@@ -1019,7 +1056,7 @@ SMB2_select_sec(struct cifs_ses *ses, struct SMB2_sess_data *sess_data)
 		sess_data->func = SMB2_sess_auth_rawntlmssp_negotiate;
 		break;
 	default:
-		cifs_dbg(VFS, "secType %d not supported!\n", ses->sectype);
+		cifs_dbg(VFS, "secType %d not supported!\n", type);
 		return -EOPNOTSUPP;
 	}
 
@@ -1141,9 +1178,6 @@ SMB2_tcon(const unsigned int xid, struct cifs_ses *ses, const char *tree,
 	else
 		return -EIO;
 
-	if (tcon && tcon->bad_network_name)
-		return -ENOENT;
-
 	unc_path = kmalloc(MAX_SHARENAME_LENGTH * 2, GFP_KERNEL);
 	if (unc_path == NULL)
 		return -ENOMEM;
@@ -1154,6 +1188,10 @@ SMB2_tcon(const unsigned int xid, struct cifs_ses *ses, const char *tree,
 		kfree(unc_path);
 		return -EINVAL;
 	}
+
+	/* SMB2 TREE_CONNECT request must be called with TreeId == 0 */
+	if (tcon)
+		tcon->tid = 0;
 
 	rc = small_smb2_init(SMB2_TREE_CONNECT, tcon, (void **) &req);
 	if (rc) {
@@ -1167,8 +1205,8 @@ SMB2_tcon(const unsigned int xid, struct cifs_ses *ses, const char *tree,
 
 		/* since no tcon, smb2_init can not do this, so do here */
 		req->hdr.sync_hdr.SessionId = ses->Suid;
-		/* if (ses->server->sec_mode & SECMODE_SIGN_REQUIRED)
-			req->hdr.Flags |= SMB2_FLAGS_SIGNED; */
+		if (ses->server->sign)
+			req->hdr.sync_hdr.Flags |= SMB2_FLAGS_SIGNED;
 	} else if (encryption_required(tcon))
 		flags |= CIFS_TRANSFORM_REQ;
 
@@ -1202,15 +1240,19 @@ SMB2_tcon(const unsigned int xid, struct cifs_ses *ses, const char *tree,
 		goto tcon_exit;
 	}
 
-	if (rsp->ShareType & SMB2_SHARE_TYPE_DISK)
+	switch (rsp->ShareType) {
+	case SMB2_SHARE_TYPE_DISK:
 		cifs_dbg(FYI, "connection to disk share\n");
-	else if (rsp->ShareType & SMB2_SHARE_TYPE_PIPE) {
+		break;
+	case SMB2_SHARE_TYPE_PIPE:
 		tcon->ipc = true;
 		cifs_dbg(FYI, "connection to pipe share\n");
-	} else if (rsp->ShareType & SMB2_SHARE_TYPE_PRINT) {
-		tcon->print = true;
+		break;
+	case SMB2_SHARE_TYPE_PRINT:
+		tcon->ipc = true;
 		cifs_dbg(FYI, "connection to printer\n");
-	} else {
+		break;
+	default:
 		cifs_dbg(VFS, "unknown share type %d\n", rsp->ShareType);
 		rc = -EOPNOTSUPP;
 		goto tcon_error_exit;
@@ -1243,8 +1285,6 @@ tcon_exit:
 tcon_error_exit:
 	if (rsp->hdr.sync_hdr.Status == STATUS_BAD_NETWORK_NAME) {
 		cifs_dbg(VFS, "BAD_NETWORK_NAME: %s\n", tree);
-		if (tcon)
-			tcon->bad_network_name = true;
 	}
 	goto tcon_exit;
 }
@@ -1527,6 +1567,51 @@ add_durable_context(struct kvec *iov, unsigned int *num_iovec,
 	return 0;
 }
 
+static int
+alloc_path_with_tree_prefix(__le16 **out_path, int *out_size, int *out_len,
+			    const char *treename, const __le16 *path)
+{
+	int treename_len, path_len;
+	struct nls_table *cp;
+	const __le16 sep[] = {cpu_to_le16('\\'), cpu_to_le16(0x0000)};
+
+	/*
+	 * skip leading "\\"
+	 */
+	treename_len = strlen(treename);
+	if (treename_len < 2 || !(treename[0] == '\\' && treename[1] == '\\'))
+		return -EINVAL;
+
+	treename += 2;
+	treename_len -= 2;
+
+	path_len = UniStrnlen((wchar_t *)path, PATH_MAX);
+
+	/*
+	 * make room for one path separator between the treename and
+	 * path
+	 */
+	*out_len = treename_len + 1 + path_len;
+
+	/*
+	 * final path needs to be null-terminated UTF16 with a
+	 * size aligned to 8
+	 */
+
+	*out_size = roundup((*out_len+1)*2, 8);
+	*out_path = kzalloc(*out_size, GFP_KERNEL);
+	if (!*out_path)
+		return -ENOMEM;
+
+	cp = load_nls_default();
+	cifs_strtoUTF16(*out_path, treename, treename_len, cp);
+	UniStrcat(*out_path, sep);
+	UniStrcat(*out_path, path);
+	unload_nls(cp);
+
+	return 0;
+}
+
 int
 SMB2_open(const unsigned int xid, struct cifs_open_parms *oparms, __le16 *path,
 	  __u8 *oplock, struct smb2_file_all_info *buf,
@@ -1575,30 +1660,49 @@ SMB2_open(const unsigned int xid, struct cifs_open_parms *oparms, __le16 *path,
 	req->ShareAccess = FILE_SHARE_ALL_LE;
 	req->CreateDisposition = cpu_to_le32(oparms->disposition);
 	req->CreateOptions = cpu_to_le32(oparms->create_options & CREATE_OPTIONS_MASK);
-	uni_path_len = (2 * UniStrnlen((wchar_t *)path, PATH_MAX)) + 2;
-	/* do not count rfc1001 len field */
-	req->NameOffset = cpu_to_le16(sizeof(struct smb2_create_req) - 4);
 
 	iov[0].iov_base = (char *)req;
 	/* 4 for rfc1002 length field */
 	iov[0].iov_len = get_rfc1002_length(req) + 4;
-
-	/* MUST set path len (NameLength) to 0 opening root of share */
-	req->NameLength = cpu_to_le16(uni_path_len - 2);
 	/* -1 since last byte is buf[0] which is sent below (path) */
 	iov[0].iov_len--;
-	if (uni_path_len % 8 != 0) {
-		copy_size = uni_path_len / 8 * 8;
-		if (copy_size < uni_path_len)
-			copy_size += 8;
 
-		copy_path = kzalloc(copy_size, GFP_KERNEL);
-		if (!copy_path)
-			return -ENOMEM;
-		memcpy((char *)copy_path, (const char *)path,
-			uni_path_len);
+	req->NameOffset = cpu_to_le16(sizeof(struct smb2_create_req) - 4);
+
+	/* [MS-SMB2] 2.2.13 NameOffset:
+	 * If SMB2_FLAGS_DFS_OPERATIONS is set in the Flags field of
+	 * the SMB2 header, the file name includes a prefix that will
+	 * be processed during DFS name normalization as specified in
+	 * section 3.3.5.9. Otherwise, the file name is relative to
+	 * the share that is identified by the TreeId in the SMB2
+	 * header.
+	 */
+	if (tcon->share_flags & SHI1005_FLAGS_DFS) {
+		int name_len;
+
+		req->hdr.sync_hdr.Flags |= SMB2_FLAGS_DFS_OPERATIONS;
+		rc = alloc_path_with_tree_prefix(&copy_path, &copy_size,
+						 &name_len,
+						 tcon->treeName, path);
+		if (rc)
+			return rc;
+		req->NameLength = cpu_to_le16(name_len * 2);
 		uni_path_len = copy_size;
 		path = copy_path;
+	} else {
+		uni_path_len = (2 * UniStrnlen((wchar_t *)path, PATH_MAX)) + 2;
+		/* MUST set path len (NameLength) to 0 opening root of share */
+		req->NameLength = cpu_to_le16(uni_path_len - 2);
+		if (uni_path_len % 8 != 0) {
+			copy_size = roundup(uni_path_len, 8);
+			copy_path = kzalloc(copy_size, GFP_KERNEL);
+			if (!copy_path)
+				return -ENOMEM;
+			memcpy((char *)copy_path, (const char *)path,
+			       uni_path_len);
+			uni_path_len = copy_size;
+			path = copy_path;
+		}
 	}
 
 	iov[1].iov_len = uni_path_len;
@@ -1683,8 +1787,9 @@ creat_exit:
  */
 int
 SMB2_ioctl(const unsigned int xid, struct cifs_tcon *tcon, u64 persistent_fid,
-	   u64 volatile_fid, u32 opcode, bool is_fsctl, char *in_data,
-	   u32 indatalen, char **out_data, u32 *plen /* returned data len */)
+	   u64 volatile_fid, u32 opcode, bool is_fsctl, bool use_ipc,
+	   char *in_data, u32 indatalen,
+	   char **out_data, u32 *plen /* returned data len */)
 {
 	struct smb2_ioctl_req *req;
 	struct smb2_ioctl_rsp *rsp;
@@ -1721,6 +1826,16 @@ SMB2_ioctl(const unsigned int xid, struct cifs_tcon *tcon, u64 persistent_fid,
 	if (rc)
 		return rc;
 
+	if (use_ipc) {
+		if (ses->ipc_tid == 0) {
+			cifs_small_buf_release(req);
+			return -ENOTCONN;
+		}
+
+		cifs_dbg(FYI, "replacing tid 0x%x with IPC tid 0x%x\n",
+			 req->hdr.sync_hdr.TreeId, ses->ipc_tid);
+		req->hdr.sync_hdr.TreeId = ses->ipc_tid;
+	}
 	if (encryption_required(tcon))
 		flags |= CIFS_TRANSFORM_REQ;
 
@@ -1747,8 +1862,12 @@ SMB2_ioctl(const unsigned int xid, struct cifs_tcon *tcon, u64 persistent_fid,
 	 * than one credit. Windows typically sets this smaller, but for some
 	 * ioctls it may be useful to allow server to send more. No point
 	 * limiting what the server can send as long as fits in one credit
+	 * Unfortunately - we can not handle more than CIFS_MAX_MSG_SIZE
+	 * (by default, note that it can be overridden to make max larger)
+	 * in responses (except for read responses which can be bigger.
+	 * We may want to bump this limit up
 	 */
-	req->MaxOutputResponse = cpu_to_le32(0xFF00); /* < 64K uses 1 credit */
+	req->MaxOutputResponse = cpu_to_le32(CIFSMaxBufSize);
 
 	if (is_fsctl)
 		req->Flags = cpu_to_le32(SMB2_0_IOCTL_IS_FSCTL);
@@ -1843,6 +1962,7 @@ SMB2_set_compression(const unsigned int xid, struct cifs_tcon *tcon,
 
 	rc = SMB2_ioctl(xid, tcon, persistent_fid, volatile_fid,
 			FSCTL_SET_COMPRESSION, true /* is_fsctl */,
+			false /* use_ipc */,
 			(char *)&fsctl_input /* data input */,
 			2 /* in data len */, &ret_data /* out data */, NULL);
 
@@ -2057,9 +2177,7 @@ smb2_echo_callback(struct mid_q_entry *mid)
 	if (mid->mid_state == MID_RESPONSE_RECEIVED)
 		credits_received = le16_to_cpu(rsp->hdr.sync_hdr.CreditRequest);
 
-	mutex_lock(&server->srv_mutex);
 	DeleteMidQEntry(mid);
-	mutex_unlock(&server->srv_mutex);
 	add_credits(server, credits_received, CIFS_ECHO_OP);
 }
 
@@ -2071,6 +2189,9 @@ void smb2_reconnect_server(struct work_struct *work)
 	struct cifs_tcon *tcon, *tcon2;
 	struct list_head tmp_list;
 	int tcon_exist = false;
+	int rc;
+	int resched = false;
+
 
 	/* Prevent simultaneous reconnects that can corrupt tcon->rlist list */
 	mutex_lock(&server->reconnect_mutex);
@@ -2098,13 +2219,18 @@ void smb2_reconnect_server(struct work_struct *work)
 	spin_unlock(&cifs_tcp_ses_lock);
 
 	list_for_each_entry_safe(tcon, tcon2, &tmp_list, rlist) {
-		if (!smb2_reconnect(SMB2_INTERNAL_CMD, tcon))
+		rc = smb2_reconnect(SMB2_INTERNAL_CMD, tcon);
+		if (!rc)
 			cifs_reopen_persistent_handles(tcon);
+		else
+			resched = true;
 		list_del_init(&tcon->rlist);
 		cifs_put_tcon(tcon);
 	}
 
 	cifs_dbg(FYI, "Reconnecting tcons finished\n");
+	if (resched)
+		queue_delayed_work(cifsiod_wq, &server->reconnect, 2 * HZ);
 	mutex_unlock(&server->reconnect_mutex);
 
 	/* now we can safely release srv struct */
@@ -2309,9 +2435,7 @@ smb2_readv_callback(struct mid_q_entry *mid)
 		cifs_stats_fail_inc(tcon, SMB2_READ_HE);
 
 	queue_work(cifsiod_wq, &rdata->work);
-	mutex_lock(&server->srv_mutex);
 	DeleteMidQEntry(mid);
-	mutex_unlock(&server->srv_mutex);
 	add_credits(server, credits_received, 0);
 }
 
@@ -2470,7 +2594,6 @@ smb2_writev_callback(struct mid_q_entry *mid)
 {
 	struct cifs_writedata *wdata = mid->callback_data;
 	struct cifs_tcon *tcon = tlink_tcon(wdata->cfile->tlink);
-	struct TCP_Server_Info *server = tcon->ses->server;
 	unsigned int written;
 	struct smb2_write_rsp *rsp = (struct smb2_write_rsp *)mid->resp_buf;
 	unsigned int credits_received = 1;
@@ -2510,9 +2633,7 @@ smb2_writev_callback(struct mid_q_entry *mid)
 		cifs_stats_fail_inc(tcon, SMB2_WRITE_HE);
 
 	queue_work(cifsiod_wq, &wdata->work);
-	mutex_lock(&server->srv_mutex);
 	DeleteMidQEntry(mid);
-	mutex_unlock(&server->srv_mutex);
 	add_credits(tcon->ses->server, credits_received, 0);
 }
 

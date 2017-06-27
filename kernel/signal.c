@@ -13,7 +13,12 @@
 #include <linux/slab.h>
 #include <linux/export.h>
 #include <linux/init.h>
-#include <linux/sched.h>
+#include <linux/sched/mm.h>
+#include <linux/sched/user.h>
+#include <linux/sched/debug.h>
+#include <linux/sched/task.h>
+#include <linux/sched/task_stack.h>
+#include <linux/sched/cputime.h>
 #include <linux/fs.h>
 #include <linux/tty.h>
 #include <linux/binfmts.h>
@@ -505,7 +510,8 @@ int unhandled_signal(struct task_struct *tsk, int sig)
 	return !tsk->ptrace;
 }
 
-static void collect_signal(int sig, struct sigpending *list, siginfo_t *info)
+static void collect_signal(int sig, struct sigpending *list, siginfo_t *info,
+			   bool *resched_timer)
 {
 	struct sigqueue *q, *first = NULL;
 
@@ -527,6 +533,12 @@ static void collect_signal(int sig, struct sigpending *list, siginfo_t *info)
 still_pending:
 		list_del_init(&first->list);
 		copy_siginfo(info, &first->info);
+
+		*resched_timer =
+			(first->flags & SIGQUEUE_PREALLOC) &&
+			(info->si_code == SI_TIMER) &&
+			(info->si_sys_private);
+
 		__sigqueue_free(first);
 	} else {
 		/*
@@ -543,12 +555,12 @@ still_pending:
 }
 
 static int __dequeue_signal(struct sigpending *pending, sigset_t *mask,
-			siginfo_t *info)
+			siginfo_t *info, bool *resched_timer)
 {
 	int sig = next_signal(pending, mask);
 
 	if (sig)
-		collect_signal(sig, pending, info);
+		collect_signal(sig, pending, info, resched_timer);
 	return sig;
 }
 
@@ -560,15 +572,16 @@ static int __dequeue_signal(struct sigpending *pending, sigset_t *mask,
  */
 int dequeue_signal(struct task_struct *tsk, sigset_t *mask, siginfo_t *info)
 {
+	bool resched_timer = false;
 	int signr;
 
 	/* We only dequeue private signals from ourselves, we don't let
 	 * signalfd steal them
 	 */
-	signr = __dequeue_signal(&tsk->pending, mask, info);
+	signr = __dequeue_signal(&tsk->pending, mask, info, &resched_timer);
 	if (!signr) {
 		signr = __dequeue_signal(&tsk->signal->shared_pending,
-					 mask, info);
+					 mask, info, &resched_timer);
 #ifdef CONFIG_POSIX_TIMERS
 		/*
 		 * itimer signal ?
@@ -616,7 +629,7 @@ int dequeue_signal(struct task_struct *tsk, sigset_t *mask, siginfo_t *info)
 		current->jobctl |= JOBCTL_STOP_DEQUEUED;
 	}
 #ifdef CONFIG_POSIX_TIMERS
-	if ((info->si_code & __SI_MASK) == __SI_TIMER && info->si_sys_private) {
+	if (resched_timer) {
 		/*
 		 * Release the siglock to ensure proper locking order
 		 * of timer locks outside of siglocks.  Note, we leave
@@ -1232,7 +1245,7 @@ struct sighand_struct *__lock_task_sighand(struct task_struct *tsk,
 		}
 		/*
 		 * This sighand can be already freed and even reused, but
-		 * we rely on SLAB_DESTROY_BY_RCU and sighand_ctor() which
+		 * we rely on SLAB_TYPESAFE_BY_RCU and sighand_ctor() which
 		 * initializes ->siglock: this slab can't go away, it has
 		 * the same object type, ->siglock can't be reinitialized.
 		 *
@@ -1313,7 +1326,7 @@ int kill_pid_info(int sig, struct siginfo *info, struct pid *pid)
 	}
 }
 
-int kill_proc_info(int sig, struct siginfo *info, pid_t pid)
+static int kill_proc_info(int sig, struct siginfo *info, pid_t pid)
 {
 	int error;
 	rcu_read_lock();
@@ -2395,11 +2408,11 @@ void exit_signals(struct task_struct *tsk)
 	 * @tsk is about to have PF_EXITING set - lock out users which
 	 * expect stable threadgroup.
 	 */
-	threadgroup_change_begin(tsk);
+	cgroup_threadgroup_change_begin(tsk);
 
 	if (thread_group_empty(tsk) || signal_group_exit(tsk->signal)) {
 		tsk->flags |= PF_EXITING;
-		threadgroup_change_end(tsk);
+		cgroup_threadgroup_change_end(tsk);
 		return;
 	}
 
@@ -2410,7 +2423,7 @@ void exit_signals(struct task_struct *tsk)
 	 */
 	tsk->flags |= PF_EXITING;
 
-	threadgroup_change_end(tsk);
+	cgroup_threadgroup_change_end(tsk);
 
 	if (!signal_pending(tsk))
 		goto out;
@@ -3239,10 +3252,17 @@ int compat_restore_altstack(const compat_stack_t __user *uss)
 
 int __compat_save_altstack(compat_stack_t __user *uss, unsigned long sp)
 {
+	int err;
 	struct task_struct *t = current;
-	return  __put_user(ptr_to_compat((void __user *)t->sas_ss_sp), &uss->ss_sp) |
-		__put_user(sas_ss_flags(sp), &uss->ss_flags) |
+	err = __put_user(ptr_to_compat((void __user *)t->sas_ss_sp),
+			 &uss->ss_sp) |
+		__put_user(t->sas_ss_flags, &uss->ss_flags) |
 		__put_user(t->sas_ss_size, &uss->ss_size);
+	if (err)
+		return err;
+	if (t->sas_ss_flags & SS_AUTODISARM)
+		sas_ss_reset(t);
+	return 0;
 }
 #endif
 

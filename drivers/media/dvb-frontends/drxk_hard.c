@@ -1626,7 +1626,7 @@ static int ctrl_power_mode(struct drxk_state *state, enum drx_power_mode *mode)
 	}
 
 	if (*mode == DRX_POWER_UP) {
-		/* Restore analog & pin configuartion */
+		/* Restore analog & pin configuration */
 	} else {
 		/* Power down to requested mode */
 		/* Backup some register settings */
@@ -1904,7 +1904,9 @@ static int get_lock_status(struct drxk_state *state, u32 *p_lock_status)
 		status = get_dvbt_lock_status(state, p_lock_status);
 		break;
 	default:
-		break;
+		pr_debug("Unsupported operation mode %d in %s\n",
+			state->m_operation_mode, __func__);
+		return 0;
 	}
 error:
 	if (status < 0)
@@ -5283,7 +5285,6 @@ static int qam_set_symbolrate(struct drxk_state *state)
 	/* Select & calculate correct IQM rate */
 	adc_frequency = (state->m_sys_clock_freq * 1000) / 3;
 	ratesel = 0;
-	/* printk(KERN_DEBUG "drxk: SR %d\n", state->props.symbol_rate); */
 	if (state->props.symbol_rate <= 1188750)
 		ratesel = 3;
 	else if (state->props.symbol_rate <= 2377500)

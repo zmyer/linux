@@ -47,7 +47,7 @@ struct security_class_mapping secclass_map[] = {
 	    "getattr", "setexec", "setfscreate", "noatsecure", "siginh",
 	    "setrlimit", "rlimitinh", "dyntransition", "setcurrent",
 	    "execmem", "execstack", "execheap", "setkeycreate",
-	    "setsockcreate", NULL } },
+	    "setsockcreate", "getrlimit", NULL } },
 	{ "system",
 	  { "ipc_info", "syslog_read", "syslog_mod",
 	    "syslog_console", "module_request", "module_load", NULL } },
@@ -229,9 +229,11 @@ struct security_class_mapping secclass_map[] = {
 	  { COMMON_SOCK_PERMS, NULL } },
 	{ "qipcrtr_socket",
 	  { COMMON_SOCK_PERMS, NULL } },
+	{ "smc_socket",
+	  { COMMON_SOCK_PERMS, NULL } },
 	{ NULL }
   };
 
-#if PF_MAX > 43
+#if PF_MAX > 44
 #error New address family defined, please update secclass_map.
 #endif

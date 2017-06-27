@@ -100,7 +100,8 @@ static int ioctl_send_fib(struct aac_dev * dev, void __user *arg)
 			goto cleanup;
 		}
 
-		kfib = pci_alloc_consistent(dev->pdev, size, &daddr);
+		kfib = dma_alloc_coherent(&dev->pdev->dev, size, &daddr,
+					  GFP_KERNEL);
 		if (!kfib) {
 			retval = -ENOMEM;
 			goto cleanup;
@@ -160,7 +161,8 @@ static int ioctl_send_fib(struct aac_dev * dev, void __user *arg)
 		retval = -EFAULT;
 cleanup:
 	if (hw_fib) {
-		pci_free_consistent(dev->pdev, size, kfib, fibptr->hw_fib_pa);
+		dma_free_coherent(&dev->pdev->dev, size, kfib,
+				  fibptr->hw_fib_pa);
 		fibptr->hw_fib_pa = hw_fib_pa;
 		fibptr->hw_fib_va = hw_fib;
 	}
@@ -580,7 +582,7 @@ static int aac_send_raw_srb(struct aac_dev* dev, void __user * arg)
 		goto cleanup;
 	}
 
-	chn = aac_logical_to_phys(user_srbcmd->channel);
+	chn = user_srbcmd->channel;
 	if (chn < AAC_MAX_BUSES && user_srbcmd->id < AAC_MAX_TARGETS &&
 		dev->hba_map[chn][user_srbcmd->id].devtype ==
 		AAC_DEVTYPE_NATIVE_RAW) {

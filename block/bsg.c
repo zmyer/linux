@@ -391,13 +391,13 @@ static int blk_complete_sgv4_hdr_rq(struct request *rq, struct sg_io_v4 *hdr,
 	struct scsi_request *req = scsi_req(rq);
 	int ret = 0;
 
-	dprintk("rq %p bio %p 0x%x\n", rq, bio, rq->errors);
+	dprintk("rq %p bio %p 0x%x\n", rq, bio, req->result);
 	/*
 	 * fill in all the output members
 	 */
-	hdr->device_status = rq->errors & 0xff;
-	hdr->transport_status = host_byte(rq->errors);
-	hdr->driver_status = driver_byte(rq->errors);
+	hdr->device_status = req->result & 0xff;
+	hdr->transport_status = host_byte(req->result);
+	hdr->driver_status = driver_byte(req->result);
 	hdr->info = 0;
 	if (hdr->device_status || hdr->transport_status || hdr->driver_status)
 		hdr->info |= SG_INFO_CHECK;
@@ -431,8 +431,8 @@ static int blk_complete_sgv4_hdr_rq(struct request *rq, struct sg_io_v4 *hdr,
 	 * just a protocol response (i.e. non negative), that gets
 	 * processed above.
 	 */
-	if (!ret && rq->errors < 0)
-		ret = rq->errors;
+	if (!ret && req->result < 0)
+		ret = req->result;
 
 	blk_rq_unmap_user(bio);
 	scsi_req_free_cmd(req);
@@ -573,7 +573,7 @@ bsg_read(struct file *file, char __user *buf, size_t count, loff_t *ppos)
 	int ret;
 	ssize_t bytes_read;
 
-	dprintk("%s: read %Zd bytes\n", bd->name, count);
+	dprintk("%s: read %zd bytes\n", bd->name, count);
 
 	bsg_set_block(bd, file);
 
@@ -648,9 +648,9 @@ bsg_write(struct file *file, const char __user *buf, size_t count, loff_t *ppos)
 	ssize_t bytes_written;
 	int ret;
 
-	dprintk("%s: write %Zd bytes\n", bd->name, count);
+	dprintk("%s: write %zd bytes\n", bd->name, count);
 
-	if (unlikely(segment_eq(get_fs(), KERNEL_DS)))
+	if (unlikely(uaccess_kernel()))
 		return -EINVAL;
 
 	bsg_set_block(bd, file);
@@ -667,7 +667,7 @@ bsg_write(struct file *file, const char __user *buf, size_t count, loff_t *ppos)
 	if (!bytes_written || err_block_err(ret))
 		bytes_written = ret;
 
-	dprintk("%s: returning %Zd\n", bd->name, bytes_written);
+	dprintk("%s: returning %zd\n", bd->name, bytes_written);
 	return bytes_written;
 }
 

@@ -28,7 +28,8 @@
 #include <linux/kernel.h>
 #include <linux/tracehook.h>
 #include <linux/errno.h>
-#include <linux/sched.h>
+#include <linux/sched/signal.h>
+#include <linux/sched/task.h>
 #include <linux/lsm_hooks.h>
 #include <linux/xattr.h>
 #include <linux/capability.h>
@@ -480,12 +481,13 @@ static int selinux_is_sblabel_mnt(struct super_block *sb)
 		sbsec->behavior == SECURITY_FS_USE_NATIVE ||
 		/* Special handling. Genfs but also in-core setxattr handler */
 		!strcmp(sb->s_type->name, "sysfs") ||
-		!strcmp(sb->s_type->name, "cgroup") ||
-		!strcmp(sb->s_type->name, "cgroup2") ||
 		!strcmp(sb->s_type->name, "pstore") ||
 		!strcmp(sb->s_type->name, "debugfs") ||
 		!strcmp(sb->s_type->name, "tracefs") ||
-		!strcmp(sb->s_type->name, "rootfs");
+		!strcmp(sb->s_type->name, "rootfs") ||
+		(selinux_policycap_cgroupseclabel &&
+		 (!strcmp(sb->s_type->name, "cgroup") ||
+		  !strcmp(sb->s_type->name, "cgroup2")));
 }
 
 static int sb_finish_set_opts(struct super_block *sb)
@@ -1104,10 +1106,8 @@ static int selinux_parse_opts_str(char *options,
 
 	opts->mnt_opts_flags = kcalloc(NUM_SEL_MNT_OPTS, sizeof(int),
 				       GFP_KERNEL);
-	if (!opts->mnt_opts_flags) {
-		kfree(opts->mnt_opts);
+	if (!opts->mnt_opts_flags)
 		goto out_err;
-	}
 
 	if (fscontext) {
 		opts->mnt_opts[num_mnt_opts] = fscontext;
@@ -1130,6 +1130,7 @@ static int selinux_parse_opts_str(char *options,
 	return 0;
 
 out_err:
+	security_free_mnt_opts(opts);
 	kfree(context);
 	kfree(defcontext);
 	kfree(fscontext);
@@ -1401,7 +1402,9 @@ static inline u16 socket_type_to_security_class(int family, int type, int protoc
 			return SECCLASS_KCM_SOCKET;
 		case PF_QIPCRTR:
 			return SECCLASS_QIPCRTR_SOCKET;
-#if PF_MAX > 43
+		case PF_SMC:
+			return SECCLASS_SMC_SOCKET;
+#if PF_MAX > 44
 #error New address family defined, please update this function.
 #endif
 		}
@@ -2397,8 +2400,7 @@ static int selinux_bprm_set_creds(struct linux_binprm *bprm)
 
 		/* Make sure that anyone attempting to ptrace over a task that
 		 * changes its SID has the appropriate permit */
-		if (bprm->unsafe &
-		    (LSM_UNSAFE_PTRACE | LSM_UNSAFE_PTRACE_CAP)) {
+		if (bprm->unsafe & LSM_UNSAFE_PTRACE) {
 			u32 ptsid = ptrace_parent_sid();
 			if (ptsid != 0) {
 				rc = avc_has_perm(ptsid, new_tsec->sid,
@@ -3917,6 +3919,21 @@ static int selinux_task_getioprio(struct task_struct *p)
 			    PROCESS__GETSCHED, NULL);
 }
 
+int selinux_task_prlimit(const struct cred *cred, const struct cred *tcred,
+			 unsigned int flags)
+{
+	u32 av = 0;
+
+	if (!flags)
+		return 0;
+	if (flags & LSM_PRLIMIT_WRITE)
+		av |= PROCESS__SETRLIMIT;
+	if (flags & LSM_PRLIMIT_READ)
+		av |= PROCESS__GETRLIMIT;
+	return avc_has_perm(cred_sid(cred), cred_sid(tcred),
+			    SECCLASS_PROCESS, av, NULL);
+}
+
 static int selinux_task_setrlimit(struct task_struct *p, unsigned int resource,
 		struct rlimit *new_rlim)
 {
@@ -4349,10 +4366,18 @@ static int selinux_socket_bind(struct socket *sock, struct sockaddr *address, in
 		u32 sid, node_perm;
 
 		if (family == PF_INET) {
+			if (addrlen < sizeof(struct sockaddr_in)) {
+				err = -EINVAL;
+				goto out;
+			}
 			addr4 = (struct sockaddr_in *)address;
 			snum = ntohs(addr4->sin_port);
 			addrp = (char *)&addr4->sin_addr.s_addr;
 		} else {
+			if (addrlen < SIN6_LEN_RFC2133) {
+				err = -EINVAL;
+				goto out;
+			}
 			addr6 = (struct sockaddr_in6 *)address;
 			snum = ntohs(addr6->sin6_port);
 			addrp = (char *)&addr6->sin6_addr.s6_addr;
@@ -4363,7 +4388,8 @@ static int selinux_socket_bind(struct socket *sock, struct sockaddr *address, in
 
 			inet_get_local_port_range(sock_net(sk), &low, &high);
 
-			if (snum < max(PROT_SOCK, low) || snum > high) {
+			if (snum < max(inet_prot_sock(sock_net(sk)), low) ||
+			    snum > high) {
 				err = sel_netport_sid(sk->sk_protocol,
 						      snum, &sid);
 				if (err)
@@ -6104,7 +6130,7 @@ static int selinux_key_getsecurity(struct key *key, char **_buffer)
 
 #endif
 
-static struct security_hook_list selinux_hooks[] = {
+static struct security_hook_list selinux_hooks[] __lsm_ro_after_init = {
 	LSM_HOOK_INIT(binder_set_context_mgr, selinux_binder_set_context_mgr),
 	LSM_HOOK_INIT(binder_transaction, selinux_binder_transaction),
 	LSM_HOOK_INIT(binder_transfer_binder, selinux_binder_transfer_binder),
@@ -6202,6 +6228,7 @@ static struct security_hook_list selinux_hooks[] = {
 	LSM_HOOK_INIT(task_setnice, selinux_task_setnice),
 	LSM_HOOK_INIT(task_setioprio, selinux_task_setioprio),
 	LSM_HOOK_INIT(task_getioprio, selinux_task_getioprio),
+	LSM_HOOK_INIT(task_prlimit, selinux_task_prlimit),
 	LSM_HOOK_INIT(task_setrlimit, selinux_task_setrlimit),
 	LSM_HOOK_INIT(task_setscheduler, selinux_task_setscheduler),
 	LSM_HOOK_INIT(task_getscheduler, selinux_task_getscheduler),

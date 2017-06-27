@@ -161,8 +161,8 @@ void kvm_async_pf_task_wait(u32 token)
 			 */
 			rcu_irq_exit();
 			native_safe_halt();
-			rcu_irq_enter();
 			local_irq_disable();
+			rcu_irq_enter();
 		}
 	}
 	if (!n.halted)
@@ -396,9 +396,9 @@ static u64 kvm_steal_clock(int cpu)
 	src = &per_cpu(steal_time, cpu);
 	do {
 		version = src->version;
-		rmb();
+		virt_rmb();
 		steal = src->steal;
-		rmb();
+		virt_rmb();
 	} while ((version & 1) || (version != src->version));
 
 	return steal;
@@ -589,13 +589,37 @@ out:
 	local_irq_restore(flags);
 }
 
-__visible bool __kvm_vcpu_is_preempted(int cpu)
+#ifdef CONFIG_X86_32
+__visible bool __kvm_vcpu_is_preempted(long cpu)
 {
 	struct kvm_steal_time *src = &per_cpu(steal_time, cpu);
 
 	return !!src->preempted;
 }
 PV_CALLEE_SAVE_REGS_THUNK(__kvm_vcpu_is_preempted);
+
+#else
+
+#include <asm/asm-offsets.h>
+
+extern bool __raw_callee_save___kvm_vcpu_is_preempted(long);
+
+/*
+ * Hand-optimize version for x86-64 to avoid 8 64-bit register saving and
+ * restoring to/from the stack.
+ */
+asm(
+".pushsection .text;"
+".global __raw_callee_save___kvm_vcpu_is_preempted;"
+".type __raw_callee_save___kvm_vcpu_is_preempted, @function;"
+"__raw_callee_save___kvm_vcpu_is_preempted:"
+"movq	__per_cpu_offset(,%rdi,8), %rax;"
+"cmpb	$0, " __stringify(KVM_STEAL_TIME_preempted) "+steal_time(%rax);"
+"setne	%al;"
+"ret;"
+".popsection");
+
+#endif
 
 /*
  * Setup pv_lock_ops to exploit KVM_FEATURE_PV_UNHALT if present.

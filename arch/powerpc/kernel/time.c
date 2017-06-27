@@ -34,6 +34,7 @@
 #include <linux/errno.h>
 #include <linux/export.h>
 #include <linux/sched.h>
+#include <linux/sched/clock.h>
 #include <linux/kernel.h>
 #include <linux/param.h>
 #include <linux/string.h>
@@ -57,7 +58,7 @@
 #include <linux/clk-provider.h>
 #include <linux/suspend.h>
 #include <linux/rtc.h>
-#include <linux/cputime.h>
+#include <linux/sched/cputime.h>
 #include <asm/trace.h>
 
 #include <asm/io.h>
@@ -709,7 +710,7 @@ unsigned long long running_clock(void)
 	 * time and on a host which doesn't do any virtualisation TB *should* equal
 	 * VTB so it makes no difference anyway.
 	 */
-	return local_clock() - cputime_to_nsecs(kcpustat_this_cpu->cpustat[CPUTIME_STEAL]);
+	return local_clock() - kcpustat_this_cpu->cpustat[CPUTIME_STEAL];
 }
 #endif
 
@@ -994,8 +995,10 @@ static void __init init_decrementer_clockevent(void)
 
 	decrementer_clockevent.max_delta_ns =
 		clockevent_delta2ns(decrementer_max, &decrementer_clockevent);
+	decrementer_clockevent.max_delta_ticks = decrementer_max;
 	decrementer_clockevent.min_delta_ns =
 		clockevent_delta2ns(2, &decrementer_clockevent);
+	decrementer_clockevent.min_delta_ticks = 2;
 
 	register_decrementer_clockevent(cpu);
 }

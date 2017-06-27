@@ -518,7 +518,6 @@ static int fault_2d(struct drm_gem_object *obj,
 
 /**
  * omap_gem_fault		-	pagefault handler for GEM objects
- * @vma: the VMA of the GEM object
  * @vmf: fault detail
  *
  * Invoked when a fault occurs on an mmap of a GEM managed area. GEM
@@ -529,8 +528,9 @@ static int fault_2d(struct drm_gem_object *obj,
  * vma->vm_private_data points to the GEM object that is backing this
  * mapping.
  */
-int omap_gem_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
+int omap_gem_fault(struct vm_fault *vmf)
 {
+	struct vm_area_struct *vma = vmf->vma;
 	struct drm_gem_object *obj = vma->vm_private_data;
 	struct omap_gem_object *omap_obj = to_omap_bo(obj);
 	struct drm_device *dev = obj->dev;
@@ -1107,9 +1107,8 @@ static inline bool is_waiting(struct omap_gem_sync_waiter *waiter)
 
 /* macro for sync debug.. */
 #define SYNCDBG 0
-#define SYNC(fmt, ...) do { if (SYNCDBG) \
-		printk(KERN_ERR "%s:%d: "fmt"\n", \
-				__func__, __LINE__, ##__VA_ARGS__); \
+#define SYNC(fmt, ...) do { if (SYNCDBG)				\
+		pr_err("%s:%d: " fmt "\n", __func__, __LINE__, ##__VA_ARGS__); \
 	} while (0)
 
 

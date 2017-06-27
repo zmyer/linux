@@ -173,6 +173,7 @@
 #define NearBranch  ((u64)1 << 52)  /* Near branches */
 #define No16	    ((u64)1 << 53)  /* No 16 bit operand */
 #define IncSP       ((u64)1 << 54)  /* SP is incremented before ModRM calc */
+#define TwoMemOp    ((u64)1 << 55)  /* Instruction has two memory operand */
 
 #define DstXacc     (DstAccLo | SrcAccHi | SrcWrite)
 
@@ -2546,7 +2547,7 @@ static int em_rsm(struct x86_emulate_ctxt *ctxt)
 	u64 smbase;
 	int ret;
 
-	if ((ctxt->emul_flags & X86EMUL_SMM_MASK) == 0)
+	if ((ctxt->ops->get_hflags(ctxt) & X86EMUL_SMM_MASK) == 0)
 		return emulate_ud(ctxt);
 
 	/*
@@ -2595,11 +2596,11 @@ static int em_rsm(struct x86_emulate_ctxt *ctxt)
 		return X86EMUL_UNHANDLEABLE;
 	}
 
-	if ((ctxt->emul_flags & X86EMUL_SMM_INSIDE_NMI_MASK) == 0)
+	if ((ctxt->ops->get_hflags(ctxt) & X86EMUL_SMM_INSIDE_NMI_MASK) == 0)
 		ctxt->ops->set_nmi_mask(ctxt, false);
 
-	ctxt->emul_flags &= ~X86EMUL_SMM_INSIDE_NMI_MASK;
-	ctxt->emul_flags &= ~X86EMUL_SMM_MASK;
+	ctxt->ops->set_hflags(ctxt, ctxt->ops->get_hflags(ctxt) &
+		~(X86EMUL_SMM_INSIDE_NMI_MASK | X86EMUL_SMM_MASK));
 	return X86EMUL_CONTINUE;
 }
 
@@ -2741,6 +2742,7 @@ static int em_syscall(struct x86_emulate_ctxt *ctxt)
 		ctxt->eflags &= ~(X86_EFLAGS_VM | X86_EFLAGS_IF);
 	}
 
+	ctxt->tf = (ctxt->eflags & X86_EFLAGS_TF) != 0;
 	return X86EMUL_CONTINUE;
 }
 
@@ -3853,6 +3855,13 @@ static int em_sti(struct x86_emulate_ctxt *ctxt)
 static int em_cpuid(struct x86_emulate_ctxt *ctxt)
 {
 	u32 eax, ebx, ecx, edx;
+	u64 msr = 0;
+
+	ctxt->ops->get_msr(ctxt, MSR_MISC_FEATURES_ENABLES, &msr);
+	if (msr & MSR_MISC_FEATURES_ENABLES_CPUID_FAULT &&
+	    ctxt->ops->cpl(ctxt)) {
+		return emulate_gp(ctxt, 0);
+	}
 
 	eax = reg_read(ctxt, VCPU_REGS_RAX);
 	ecx = reg_read(ctxt, VCPU_REGS_RCX);
@@ -4165,7 +4174,7 @@ static int check_dr_write(struct x86_emulate_ctxt *ctxt)
 
 static int check_svme(struct x86_emulate_ctxt *ctxt)
 {
-	u64 efer;
+	u64 efer = 0;
 
 	ctxt->ops->get_msr(ctxt, MSR_EFER, &efer);
 
@@ -4298,7 +4307,7 @@ static const struct opcode group1[] = {
 };
 
 static const struct opcode group1A[] = {
-	I(DstMem | SrcNone | Mov | Stack | IncSP, em_pop), N, N, N, N, N, N, N,
+	I(DstMem | SrcNone | Mov | Stack | IncSP | TwoMemOp, em_pop), N, N, N, N, N, N, N,
 };
 
 static const struct opcode group2[] = {
@@ -4336,7 +4345,7 @@ static const struct opcode group5[] = {
 	I(SrcMemFAddr | ImplicitOps,		em_call_far),
 	I(SrcMem | NearBranch,			em_jmp_abs),
 	I(SrcMemFAddr | ImplicitOps,		em_jmp_far),
-	I(SrcMem | Stack,			em_push), D(Undefined),
+	I(SrcMem | Stack | TwoMemOp,		em_push), D(Undefined),
 };
 
 static const struct opcode group6[] = {
@@ -4556,8 +4565,8 @@ static const struct opcode opcode_table[256] = {
 	/* 0xA0 - 0xA7 */
 	I2bv(DstAcc | SrcMem | Mov | MemAbs, em_mov),
 	I2bv(DstMem | SrcAcc | Mov | MemAbs | PageTable, em_mov),
-	I2bv(SrcSI | DstDI | Mov | String, em_mov),
-	F2bv(SrcSI | DstDI | String | NoWrite, em_cmp_r),
+	I2bv(SrcSI | DstDI | Mov | String | TwoMemOp, em_mov),
+	F2bv(SrcSI | DstDI | String | NoWrite | TwoMemOp, em_cmp_r),
 	/* 0xA8 - 0xAF */
 	F2bv(DstAcc | SrcImm | NoWrite, em_test),
 	I2bv(SrcAcc | DstDI | Mov | String, em_mov),
@@ -5315,6 +5324,7 @@ int x86_emulate_insn(struct x86_emulate_ctxt *ctxt)
 	const struct x86_emulate_ops *ops = ctxt->ops;
 	int rc = X86EMUL_CONTINUE;
 	int saved_dst_type = ctxt->dst.type;
+	unsigned emul_flags;
 
 	ctxt->mem_read.pos = 0;
 
@@ -5329,6 +5339,7 @@ int x86_emulate_insn(struct x86_emulate_ctxt *ctxt)
 		goto done;
 	}
 
+	emul_flags = ctxt->ops->get_hflags(ctxt);
 	if (unlikely(ctxt->d &
 		     (No64|Undefined|Sse|Mmx|Intercept|CheckPerm|Priv|Prot|String))) {
 		if ((ctxt->mode == X86EMUL_MODE_PROT64 && (ctxt->d & No64)) ||
@@ -5362,7 +5373,7 @@ int x86_emulate_insn(struct x86_emulate_ctxt *ctxt)
 				fetch_possible_mmx_operand(ctxt, &ctxt->dst);
 		}
 
-		if (unlikely(ctxt->emul_flags & X86EMUL_GUEST_MASK) && ctxt->intercept) {
+		if (unlikely(emul_flags & X86EMUL_GUEST_MASK) && ctxt->intercept) {
 			rc = emulator_check_intercept(ctxt, ctxt->intercept,
 						      X86_ICPT_PRE_EXCEPT);
 			if (rc != X86EMUL_CONTINUE)
@@ -5391,7 +5402,7 @@ int x86_emulate_insn(struct x86_emulate_ctxt *ctxt)
 				goto done;
 		}
 
-		if (unlikely(ctxt->emul_flags & X86EMUL_GUEST_MASK) && (ctxt->d & Intercept)) {
+		if (unlikely(emul_flags & X86EMUL_GUEST_MASK) && (ctxt->d & Intercept)) {
 			rc = emulator_check_intercept(ctxt, ctxt->intercept,
 						      X86_ICPT_POST_EXCEPT);
 			if (rc != X86EMUL_CONTINUE)
@@ -5445,7 +5456,7 @@ int x86_emulate_insn(struct x86_emulate_ctxt *ctxt)
 
 special_insn:
 
-	if (unlikely(ctxt->emul_flags & X86EMUL_GUEST_MASK) && (ctxt->d & Intercept)) {
+	if (unlikely(emul_flags & X86EMUL_GUEST_MASK) && (ctxt->d & Intercept)) {
 		rc = emulator_check_intercept(ctxt, ctxt->intercept,
 					      X86_ICPT_POST_MEMACCESS);
 		if (rc != X86EMUL_CONTINUE)
@@ -5670,4 +5681,15 @@ void emulator_invalidate_register_cache(struct x86_emulate_ctxt *ctxt)
 void emulator_writeback_register_cache(struct x86_emulate_ctxt *ctxt)
 {
 	writeback_registers(ctxt);
+}
+
+bool emulator_can_use_gpa(struct x86_emulate_ctxt *ctxt)
+{
+	if (ctxt->rep_prefix && (ctxt->d & String))
+		return false;
+
+	if (ctxt->d & TwoMemOp)
+		return false;
+
+	return true;
 }

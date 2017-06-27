@@ -183,6 +183,7 @@ static int rwbf_quirk;
  * (used when kernel is launched w/ TXT)
  */
 static int force_on = 0;
+int intel_iommu_tboot_noforce;
 
 /*
  * 0: Present
@@ -607,6 +608,10 @@ static int __init intel_iommu_setup(char *str)
 				"Intel-IOMMU: enable pre-production PASID support\n");
 			intel_iommu_pasid28 = 1;
 			iommu_identity_mapping |= IDENTMAP_GFX;
+		} else if (!strncmp(str, "tboot_noforce", 13)) {
+			printk(KERN_INFO
+				"Intel-IOMMU: not forcing on after tboot. This could expose security risk for tboot\n");
+			intel_iommu_tboot_noforce = 1;
 		}
 
 		str += strcspn(str, ",");
@@ -916,7 +921,7 @@ static struct intel_iommu *device_to_iommu(struct device *dev, u8 *bus, u8 *devf
 				 * which we used for the IOMMU lookup. Strictly speaking
 				 * we could do this for all PCI devices; we only need to
 				 * get the BDF# from the scope table for ACPI matches. */
-				if (pdev->is_virtfn)
+				if (pdev && pdev->is_virtfn)
 					goto got_pdev;
 
 				*bus = drhd->devices[i].bus;
@@ -2050,11 +2055,14 @@ static int domain_context_mapping_one(struct dmar_domain *domain,
 	if (context_copied(context)) {
 		u16 did_old = context_domain_id(context);
 
-		if (did_old >= 0 && did_old < cap_ndoms(iommu->cap))
+		if (did_old >= 0 && did_old < cap_ndoms(iommu->cap)) {
 			iommu->flush.flush_context(iommu, did_old,
 						   (((u16)bus) << 8) | devfn,
 						   DMA_CCMD_MASK_NOBIT,
 						   DMA_CCMD_DEVICE_INVL);
+			iommu->flush.flush_iotlb(iommu, did_old, 0, 0,
+						 DMA_TLB_DSI_FLUSH);
+		}
 	}
 
 	pgd = domain->pgd;
@@ -3829,7 +3837,7 @@ static void *intel_alloc_coherent(struct device *dev, size_t size,
 	if (gfpflags_allow_blocking(flags)) {
 		unsigned int count = size >> PAGE_SHIFT;
 
-		page = dma_alloc_from_contiguous(dev, count, order);
+		page = dma_alloc_from_contiguous(dev, count, order, flags);
 		if (page && iommu_no_mapping(dev) &&
 		    page_to_phys(page) + size > dev->coherent_dma_mask) {
 			dma_release_from_contiguous(dev, page, count);
@@ -4730,11 +4738,25 @@ static int intel_iommu_cpu_dead(unsigned int cpu)
 	return 0;
 }
 
+static void intel_disable_iommus(void)
+{
+	struct intel_iommu *iommu = NULL;
+	struct dmar_drhd_unit *drhd;
+
+	for_each_iommu(iommu, drhd)
+		iommu_disable_translation(iommu);
+}
+
+static inline struct intel_iommu *dev_to_intel_iommu(struct device *dev)
+{
+	return container_of(dev, struct intel_iommu, iommu.dev);
+}
+
 static ssize_t intel_iommu_show_version(struct device *dev,
 					struct device_attribute *attr,
 					char *buf)
 {
-	struct intel_iommu *iommu = dev_get_drvdata(dev);
+	struct intel_iommu *iommu = dev_to_intel_iommu(dev);
 	u32 ver = readl(iommu->reg + DMAR_VER_REG);
 	return sprintf(buf, "%d:%d\n",
 		       DMAR_VER_MAJOR(ver), DMAR_VER_MINOR(ver));
@@ -4745,7 +4767,7 @@ static ssize_t intel_iommu_show_address(struct device *dev,
 					struct device_attribute *attr,
 					char *buf)
 {
-	struct intel_iommu *iommu = dev_get_drvdata(dev);
+	struct intel_iommu *iommu = dev_to_intel_iommu(dev);
 	return sprintf(buf, "%llx\n", iommu->reg_phys);
 }
 static DEVICE_ATTR(address, S_IRUGO, intel_iommu_show_address, NULL);
@@ -4754,7 +4776,7 @@ static ssize_t intel_iommu_show_cap(struct device *dev,
 				    struct device_attribute *attr,
 				    char *buf)
 {
-	struct intel_iommu *iommu = dev_get_drvdata(dev);
+	struct intel_iommu *iommu = dev_to_intel_iommu(dev);
 	return sprintf(buf, "%llx\n", iommu->cap);
 }
 static DEVICE_ATTR(cap, S_IRUGO, intel_iommu_show_cap, NULL);
@@ -4763,7 +4785,7 @@ static ssize_t intel_iommu_show_ecap(struct device *dev,
 				    struct device_attribute *attr,
 				    char *buf)
 {
-	struct intel_iommu *iommu = dev_get_drvdata(dev);
+	struct intel_iommu *iommu = dev_to_intel_iommu(dev);
 	return sprintf(buf, "%llx\n", iommu->ecap);
 }
 static DEVICE_ATTR(ecap, S_IRUGO, intel_iommu_show_ecap, NULL);
@@ -4772,7 +4794,7 @@ static ssize_t intel_iommu_show_ndoms(struct device *dev,
 				      struct device_attribute *attr,
 				      char *buf)
 {
-	struct intel_iommu *iommu = dev_get_drvdata(dev);
+	struct intel_iommu *iommu = dev_to_intel_iommu(dev);
 	return sprintf(buf, "%ld\n", cap_ndoms(iommu->cap));
 }
 static DEVICE_ATTR(domains_supported, S_IRUGO, intel_iommu_show_ndoms, NULL);
@@ -4781,7 +4803,7 @@ static ssize_t intel_iommu_show_ndoms_used(struct device *dev,
 					   struct device_attribute *attr,
 					   char *buf)
 {
-	struct intel_iommu *iommu = dev_get_drvdata(dev);
+	struct intel_iommu *iommu = dev_to_intel_iommu(dev);
 	return sprintf(buf, "%d\n", bitmap_weight(iommu->domain_ids,
 						  cap_ndoms(iommu->cap)));
 }
@@ -4835,8 +4857,28 @@ int __init intel_iommu_init(void)
 		goto out_free_dmar;
 	}
 
-	if (no_iommu || dmar_disabled)
+	if (no_iommu || dmar_disabled) {
+		/*
+		 * We exit the function here to ensure IOMMU's remapping and
+		 * mempool aren't setup, which means that the IOMMU's PMRs
+		 * won't be disabled via the call to init_dmars(). So disable
+		 * it explicitly here. The PMRs were setup by tboot prior to
+		 * calling SENTER, but the kernel is expected to reset/tear
+		 * down the PMRs.
+		 */
+		if (intel_iommu_tboot_noforce) {
+			for_each_iommu(iommu, drhd)
+				iommu_disable_protect_mem_regions(iommu);
+		}
+
+		/*
+		 * Make sure the IOMMUs are switched off, even when we
+		 * boot into a kexec kernel and the previous kernel left
+		 * them enabled
+		 */
+		intel_disable_iommus();
 		goto out_free_dmar;
+	}
 
 	if (list_empty(&dmar_rmrr_units))
 		pr_info("No RMRR found\n");
@@ -5244,7 +5286,7 @@ static void intel_iommu_get_resv_regions(struct device *device,
 
 	reg = iommu_alloc_resv_region(IOAPIC_RANGE_START,
 				      IOAPIC_RANGE_END - IOAPIC_RANGE_START + 1,
-				      0, IOMMU_RESV_RESERVED);
+				      0, IOMMU_RESV_MSI);
 	if (!reg)
 		return;
 	list_add_tail(&reg->list, head);

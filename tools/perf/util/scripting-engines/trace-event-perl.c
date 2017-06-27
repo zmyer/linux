@@ -19,6 +19,7 @@
  *
  */
 
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -27,7 +28,9 @@
 #include <linux/bitmap.h>
 #include <linux/time64.h>
 
-#include "../util.h"
+#include <stdbool.h>
+/* perl needs the following define, right after including stdbool.h */
+#define HAS_BOOL
 #include <EXTERN.h>
 #include <perl.h>
 
@@ -217,6 +220,7 @@ static void define_event_symbols(struct event_format *event,
 				       cur_field_name);
 		break;
 	case PRINT_HEX:
+	case PRINT_HEX_STR:
 		define_event_symbols(event, ev_name, args->hex.field);
 		define_event_symbols(event, ev_name, args->hex.size);
 		break;

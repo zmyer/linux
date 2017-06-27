@@ -99,8 +99,7 @@ static int aac_alloc_comm(struct aac_dev *dev, void **commaddr, unsigned long co
 	size = fibsize + aac_init_size + commsize + commalign +
 			printfbufsiz + host_rrq_size;
 
-	base = pci_alloc_consistent(dev->pdev, size, &phys);
-
+	base = dma_alloc_coherent(&dev->pdev->dev, size, &phys, GFP_KERNEL);
 	if (base == NULL) {
 		printk(KERN_ERR "aacraid: unable to create mapping.\n");
 		return 0;
@@ -330,7 +329,7 @@ int aac_send_shutdown(struct aac_dev * dev)
 	     dev->pdev->device == PMC_DEVICE_S8 ||
 	     dev->pdev->device == PMC_DEVICE_S9) &&
 	     dev->msi_enabled)
-		aac_src_access_devreg(dev, AAC_ENABLE_INTX);
+		aac_set_intx_mode(dev);
 	return status;
 }
 

@@ -406,7 +406,7 @@ int platform_device_add(struct platform_device *pdev)
 		}
 
 		if (p && insert_resource(p, r)) {
-			dev_err(&pdev->dev, "failed to claim resource %d\n", i);
+			dev_err(&pdev->dev, "failed to claim resource %d: %pR\n", i, r);
 			ret = -EBUSY;
 			goto failed;
 		}
@@ -847,7 +847,7 @@ static ssize_t modalias_show(struct device *dev, struct device_attribute *a,
 	struct platform_device	*pdev = to_platform_device(dev);
 	int len;
 
-	len = of_device_get_modalias(dev, buf, PAGE_SIZE -1);
+	len = of_device_modalias(dev, buf, PAGE_SIZE);
 	if (len != -ENODEV)
 		return len;
 
